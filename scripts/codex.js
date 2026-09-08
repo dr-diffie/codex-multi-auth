@@ -78,6 +78,8 @@ const APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME";
 const APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM";
+const RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV =
+	"CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL";
 const APP_SERVER_CONFIG_ARGS_ENV =
 	"CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON";
 const APP_RUNTIME_HELPER_STATUS_FILE =
@@ -167,6 +169,51 @@ let warnedPendingAccountReadIdOverflow = false;
 let warnedShadowHomeSqliteLinkFailure = false;
 const warnedShadowHomeLinkOnlyDirectoryFailures = new Set();
 const warnedShadowHomeSqliteSidecarPlaceholderFailures = new Set();
+
+function resolveRuntimeRotationProxyUpstreamBaseUrl(env = process.env) {
+	const raw = (env[RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV] ?? "").trim();
+	if (!raw) {
+		return undefined;
+	}
+
+	let parsed;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error(
+			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must be an absolute loopback HTTP URL.`,
+		);
+	}
+
+	const hostname = parsed.hostname.toLowerCase();
+	const loopback =
+		hostname === "127.0.0.1" ||
+		hostname === "localhost" ||
+		hostname === "[::1]" ||
+		hostname === "::1";
+	if (
+		parsed.protocol !== "http:" ||
+		!loopback ||
+		!parsed.port ||
+		parsed.username ||
+		parsed.password ||
+		parsed.search ||
+		parsed.hash
+	) {
+		throw new Error(
+			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must use loopback HTTP with an explicit port and no credentials, query, or fragment.`,
+		);
+	}
+
+	return parsed.toString().replace(/\/$/, "");
+}
+
+function createRuntimeRotationProxyOptions(clientApiKey, env = process.env) {
+	const upstreamBaseUrl = resolveRuntimeRotationProxyUpstreamBaseUrl(env);
+	return upstreamBaseUrl
+		? { clientApiKey, upstreamBaseUrl }
+		: { clientApiKey };
+}
 
 async function loadRuntimeConstants() {
 	const fallback = {
@@ -4711,7 +4758,9 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			throw new Error("runtime rotation config helpers are unavailable");
 		}
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
-		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
+		proxyServer = await proxyModule.startRuntimeRotationProxy(
+			createRuntimeRotationProxyOptions(clientApiKey),
+		);
 		const useCanonicalHome =
 			(process.env[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV] ?? "").trim() ===
 			"1";
@@ -5117,8 +5166,29 @@ async function createRuntimeRotationProxyContextIfEnabled(
 		return baseContext;
 	}
 
+	let configuredUpstreamBaseUrl;
+	try {
+		configuredUpstreamBaseUrl =
+			resolveRuntimeRotationProxyUpstreamBaseUrl(baseContext.env);
+	} catch (error) {
+		baseContext.cleanup?.();
+		return {
+			startupError: `codex-multi-auth runtime rotation upstream is invalid: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		};
+	}
+	const requireConfiguredUpstream = configuredUpstreamBaseUrl !== undefined;
+
 	const configTomlModule = await loadRuntimeConfigTomlModule();
 	if (!configTomlModule) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError:
+					"codex-multi-auth runtime rotation config helpers are unavailable; configured upstream routing cannot continue.",
+			};
+		}
 		console.error(
 			"codex-multi-auth runtime rotation config helpers are unavailable; continuing without runtime rotation.",
 		);
@@ -5188,6 +5258,13 @@ async function createRuntimeRotationProxyContextIfEnabled(
 
 	const proxyModule = await loadRuntimeRotationProxyModule();
 	if (!proxyModule) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError:
+					"codex-multi-auth runtime rotation proxy is unavailable; configured upstream routing cannot continue.",
+			};
+		}
 		console.error(
 			"codex-multi-auth runtime rotation proxy is unavailable; continuing without runtime rotation.",
 		);
@@ -5198,7 +5275,9 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	let shadowContext;
 	try {
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
-		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
+		proxyServer = await proxyModule.startRuntimeRotationProxy(
+			createRuntimeRotationProxyOptions(clientApiKey, baseContext.env),
+		);
 		shadowContext = createRuntimeRotationProxyCodexHome(
 			baseContext.env,
 			proxyServer.baseUrl,
@@ -5210,6 +5289,14 @@ async function createRuntimeRotationProxyContextIfEnabled(
 			await proxyServer?.close?.();
 		} catch {
 			// Best-effort cleanup only.
+		}
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation proxy failed to start with configured upstream: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
 		}
 		console.error(
 			`codex-multi-auth runtime rotation proxy failed to start; continuing without runtime rotation: ${error instanceof Error ? error.message : String(error)}`,

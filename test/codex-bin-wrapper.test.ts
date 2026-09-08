@@ -372,8 +372,11 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"  };",
 			"}",
 			"",
-			"export async function startRuntimeRotationProxy() {",
+			"export async function startRuntimeRotationProxy(options = {}) {",
 			"  const baseUrl = process.env.CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL ?? 'http://127.0.0.1:4567';",
+			"  if ((process.env.CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM ?? '').trim() === '1') {",
+			"    appendMarker(`upstream:${options.upstreamBaseUrl ?? ''}`);",
+			"  }",
 			// Opt-in (#623): record the forced-account pin env the proxy process actually
 			// observed, so a test can prove the value crossed the launcher -> detached
 			// app-helper boundary. Gated so it never perturbs the exact-marker assertions
@@ -1632,6 +1635,81 @@ describe("codex bin wrapper", () => {
 		expect(result.stdout).toContain(
 			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
 		);
+	});
+
+	it.each([
+		["shadow runtime", ["exec", "status"]],
+		["interactive helper", ["resume", "session-fixture"]],
+	])(
+		"forwards an explicit loopback upstream through the %s proxy",
+		async (_label, args) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, args, {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+					"http://127.0.0.1:8787/backend-api",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "150",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM: "1",
+			});
+
+			expect(result.status).toBe(0);
+			await waitForFileText(
+				markerPath,
+				[
+					"upstream:http://127.0.0.1:8787/backend-api",
+					"start:http://127.0.0.1:4567",
+					"close",
+					"",
+				].join("\n"),
+			);
+		},
+	);
+
+	it.each([
+		"https://127.0.0.1:8787/backend-api",
+		"http://example.com:8787/backend-api",
+		"http://127.0.0.1/backend-api",
+		"http://user:pass@127.0.0.1:8787/backend-api",
+		"http://127.0.0.1:8787/backend-api?route=unsafe",
+		"not-a-url",
+	])("fails closed for an unsafe runtime-proxy upstream: %s", (upstream) => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL: upstream,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+
+		expect(result.status).toBe(1);
+		expect(combinedOutput(result)).toContain(
+			"codex-multi-auth runtime rotation upstream is invalid",
+		);
+		expect(existsSync(markerPath)).toBe(false);
+		expect(result.stdout).not.toContain("FORWARDED:");
 	});
 
 	it("starts the opt-in runtime rotation proxy with a shadow CODEX_HOME provider", () => {
