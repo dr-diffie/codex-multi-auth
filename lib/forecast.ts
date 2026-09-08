@@ -10,6 +10,7 @@ import {
 	isQuotaCacheEntryExhausted,
 	quotaUsedPercentIsExhausted,
 } from "./quota-readiness.js";
+import { redactEmails } from "./redaction.js";
 import type { ModelFamily } from "./request/helpers/model-map.js";
 import {
 	getRateLimitResetTimeForFamily,
@@ -103,24 +104,6 @@ export interface ForecastSummary {
 function clampRisk(score: number): number {
 	if (!Number.isFinite(score)) return 100;
 	return Math.max(0, Math.min(100, Math.round(score)));
-}
-
-function maskEmail(value: string): string {
-	const atIndex = value.indexOf("@");
-	if (atIndex <= 0) return "***@***";
-	const local = value.slice(0, atIndex);
-	const domain = value.slice(atIndex + 1);
-	const domainParts = domain.split(".");
-	const tld = domainParts.pop() ?? "";
-	const prefix = local.slice(0, Math.min(2, local.length));
-	return `${prefix}***@***.${tld || "***"}`;
-}
-
-function redactEmails(value: string): string {
-	return value.replace(
-		/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
-		(match) => maskEmail(match),
-	);
 }
 
 function redactSensitiveReason(value: string): string {
