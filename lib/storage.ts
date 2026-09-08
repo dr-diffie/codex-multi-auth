@@ -1291,7 +1291,8 @@ export function normalizeAccountStorage(
 		if (
 			typeof raw !== "number" ||
 			!Number.isFinite(raw) ||
-			!Number.isInteger(raw) ||
+			// See readAffinityGenerationFromDisk: an unsafe integer wedges the bump.
+			!Number.isSafeInteger(raw) ||
 			raw < 0
 		) {
 			log.warn("Dropping invalid affinityGeneration from storage", {
@@ -1339,7 +1340,11 @@ export function readAffinityGenerationFromDisk(path: string): number {
 		if (
 			typeof generation === "number" &&
 			Number.isFinite(generation) &&
-			Number.isInteger(generation) &&
+			// Safe, not merely integral: past 2^53 `Math.max(gen, disk) + 1 === gen`,
+			// so `bumpStorageAffinityGeneration` silently stops advancing and no
+			// running proxy ever observes another `switch`. Rejecting the value
+			// lets the next bump write 1 and repair the file.
+			Number.isSafeInteger(generation) &&
 			generation >= 0
 		) {
 			return generation;
@@ -1378,7 +1383,13 @@ export function bumpStorageAffinityGeneration(
 		// No resolvable storage path (never configured). The in-memory counter
 		// is still bumped below; only the lost-update guard is unavailable.
 	}
-	const inMemoryGeneration = storage.affinityGeneration ?? 0;
+	// Guard the in-memory side too, not just the disk read. Past 2^53
+	// `Math.max(gen, disk) + 1 === gen`, so an unsafe value here would write the
+	// same generation forever and no running proxy would observe another
+	// `switch`. Treating it as 0 makes the next write repair the counter.
+	const rawInMemory = storage.affinityGeneration ?? 0;
+	const inMemoryGeneration =
+		Number.isSafeInteger(rawInMemory) && rawInMemory >= 0 ? rawInMemory : 0;
 	const next = Math.max(inMemoryGeneration, diskGeneration) + 1;
 	storage.affinityGeneration = next;
 	return next;
@@ -1454,7 +1465,8 @@ export function readPinAndGenFromDisk(
 	const affinityGeneration =
 		typeof rawGen === "number" &&
 		Number.isFinite(rawGen) &&
-		Number.isInteger(rawGen) &&
+		// See readAffinityGenerationFromDisk: an unsafe integer wedges the bump.
+		Number.isSafeInteger(rawGen) &&
 		rawGen >= 0
 			? rawGen
 			: 0;

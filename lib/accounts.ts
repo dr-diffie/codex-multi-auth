@@ -492,7 +492,8 @@ export class AccountManager {
 		this.affinityGeneration =
 			typeof rawStoredGen === "number" &&
 			Number.isFinite(rawStoredGen) &&
-			Number.isInteger(rawStoredGen) &&
+			// See readAffinityGenerationFromDisk: an unsafe integer wedges the bump.
+			Number.isSafeInteger(rawStoredGen) &&
 			rawStoredGen >= 0
 				? rawStoredGen
 				: 0;
