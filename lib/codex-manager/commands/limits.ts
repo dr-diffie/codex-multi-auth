@@ -112,10 +112,12 @@ export async function runLimitsCommand(
 					generatedAt,
 					mode: parsed.options.refresh ? "refresh" : "cached",
 					// Keep the key set identical for an empty pool so a consumer
-					// never has to branch on its presence.
+					// never has to branch on its presence. There is no account to
+					// route to, so `routedIndex` is null rather than a positional 0
+					// that addresses nothing.
 					selection: {
 						pinnedIndex: null,
-						routedIndex: 0,
+						routedIndex: null,
 						activeIndexByFamily: {},
 					},
 					accounts: [],
@@ -173,24 +175,38 @@ export async function runLimitsCommand(
 }
 
 /**
- * Which account actually serves traffic, and the state that decides it.
+ * The CONFIGURED routing target, and the state that decides it.
  *
  * `current` cannot be `activeIndexByFamily.codex` alone. The runtime proxy
  * routes on `pinnedAccountIndex` whenever a `switch` pin is set, and flows that
  * move the active index without touching the pin (rotation saves, `unpin`, an
  * ephemeral `--account`) would otherwise leave `current: true` on a row that is
- * not serving anything. Both inputs are emitted so a consumer can tell which
- * one applied, and the per-family map is emitted because a pool can hold a
- * different active index per family.
+ * not the configured target. Both inputs are emitted so a consumer can tell
+ * which one applied, and the per-family map is emitted because a pool can hold
+ * a different active index per family.
+ *
+ * This is deliberately NOT a prediction of which account the next request
+ * lands on. The proxy skips an account that is disabled, inside a rate-limit
+ * window, cooling down, or behind an open circuit breaker, and it applies
+ * session affinity and an ephemeral `--account` override that never touch
+ * storage. Reproducing that here would mean a third copy of the selector
+ * (`why-selected` and `forecast` already own live selection), and a snapshot
+ * read from a cache cannot be authoritative about it in any case. Consumers
+ * that need liveness have `enabled` on every row and `why-selected --json`.
+ *
+ * `routedIndex` is null only for an empty pool, where no row is `current`.
  */
 function resolveSelection(
 	storage: AccountStorageV3,
 	resolveActiveIndex: LimitsCommandDeps["resolveActiveIndex"],
 ): {
 	pinnedIndex: number | null;
-	routedIndex: number;
+	routedIndex: number | null;
 	activeIndexByFamily: Partial<Record<ModelFamily, number>>;
 } {
+	if (storage.accounts.length === 0) {
+		return { pinnedIndex: null, routedIndex: null, activeIndexByFamily: {} };
+	}
 	const activeIndexByFamily: Partial<Record<ModelFamily, number>> = {};
 	for (const family of MODEL_FAMILIES) {
 		activeIndexByFamily[family] = resolveActiveIndex(storage, family);

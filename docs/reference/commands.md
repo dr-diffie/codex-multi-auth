@@ -110,11 +110,19 @@ Unavailable provider values are explicit JSON `null`; internal probe-model names
 credentials, and orphan cache entries are not emitted. Account emails are masked
 inside `label` the same way `forecast --json` masks them.
 
-`selection` reports how the routed account was chosen: `pinnedIndex` is the
-`switch` pin or `null`, `activeIndexByFamily` is the per-family active index,
-and `routedIndex` is the account the runtime proxy actually serves from
-(`pinnedIndex` when a pin is set, otherwise the `codex` active index). An
-account's `current` is true when its `index` equals `routedIndex`.
+`selection` reports the configured routing target: `pinnedIndex` is the `switch`
+pin or `null`, `activeIndexByFamily` is the per-family active index, and
+`routedIndex` is `pinnedIndex` when a pin is set and the `codex` active index
+otherwise (`null` for an empty pool). An account's `current` is true when its
+`index` equals `routedIndex`.
+
+`selection` describes configuration, not liveness. It is not a prediction of
+which account the next request lands on: the runtime proxy skips an account that
+is disabled, inside a rate-limit window, cooling down, or behind an open circuit
+breaker, and it applies session affinity and the ephemeral `--account` override,
+none of which are written to storage. Use `enabled` on each row for the cheap
+check, and `why-selected --json` when you need the live selection and its
+reasoning.
 
 `--json` (`-j`) is required. `--help` / `-h` prints focused usage. Unknown flags
 fail with exit code 1 without reading account storage or quota cache.

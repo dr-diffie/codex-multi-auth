@@ -234,11 +234,39 @@ describe("runLimitsCommand", () => {
 			mode: "cached",
 			selection: {
 				pinnedIndex: null,
-				routedIndex: 0,
+				routedIndex: null,
 				activeIndexByFamily: {},
 			},
 			accounts: [],
 		});
+	});
+
+	it("reports the configured target even when that account cannot serve", async () => {
+		// `selection` is configuration, not liveness. The proxy skips a disabled,
+		// rate-limited, cooling-down or circuit-broken account, and applies
+		// session affinity and --account, none of which touch storage. Predicting
+		// that here would be a third copy of the selector; `why-selected` owns it.
+		// The contract is pinned so the field is not mistaken for a live answer:
+		// `current` follows the configured pin, and `enabled` stays visible next
+		// to it so a consumer can see the account cannot serve.
+		const deps = createDeps();
+		const storage = accountStorageV3Fixture([
+			storageAccountFixture({ accountId: "acct-1", email: "one@example.com" }),
+			storageAccountFixture({
+				accountId: "acct-2",
+				email: "two@example.com",
+				enabled: false,
+			}),
+		]);
+		storage.pinnedAccountIndex = 1;
+		deps.loadAccounts.mockResolvedValueOnce(storage);
+
+		expect(await runLimitsCommand(["--json"], deps)).toBe(0);
+
+		const payload = emittedJson(deps);
+		expect(payload.selection).toMatchObject({ pinnedIndex: 1, routedIndex: 1 });
+		const accounts = payload.accounts as Array<Record<string, unknown>>;
+		expect(accounts[1]).toMatchObject({ current: true, enabled: false });
 	});
 
 	it("marks the pinned account current, not the family active index", async () => {
