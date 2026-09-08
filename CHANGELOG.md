@@ -5,6 +5,64 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.13.0] - 2026-09-08
+
+A machine-readable quota snapshot, an explicit loopback upstream for the runtime proxy, and a manual `switch` that actually revalidates a rate-limited account. [Full notes](docs/releases/v2.13.0.md).
+
+### Added
+
+- `codex-multi-auth limits --json [--refresh]` prints a stable quota snapshot for
+  local integrations, so nothing has to scrape terminal output or read the
+  internal cache file. Cached mode makes no network requests; `--refresh` reuses
+  the dashboard's sequential refresh and its five-minute freshness floor. The
+  payload carries `schemaVersion: 1`, a `selection` block naming the pin, the
+  per-family active index and the resulting `routedIndex`, and one row per
+  account. Absent provider values are explicit JSON `null`, access tokens and
+  probe-model names are never emitted, and account emails are masked in `label`
+  exactly as `forecast --json` masks them
+  ([#688](https://github.com/ndycode/codex-multi-auth/pull/688), closing
+  [#687](https://github.com/ndycode/codex-multi-auth/issues/687))
+- `CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL` routes the runtime rotation
+  proxy through an explicit local upstream for operators chaining it into a local
+  inspection proxy. The value must be HTTP with a numeric loopback host
+  (`127.0.0.0/8` or `[::1]`) and an explicit port; a name such as `localhost` is
+  rejected because the OS resolves it at connect time and the request carries the
+  managed OAuth bearer token. It fails closed: an invalid value, a proxy that
+  cannot start, or runtime rotation being disabled all exit non-zero on a
+  request-bearing invocation rather than falling back to the direct backend
+  ([#690](https://github.com/ndycode/codex-multi-auth/pull/690))
+
+### Fixed
+
+- `switch <n>` clears the selected account's rate-limit windows in the same
+  atomic write that sets the pin. After an out-of-band quota reset the markers
+  survived, so the runtime proxy kept treating the account as blocked and
+  deferring or returning 503 until the recorded window expired on its own: the
+  one command meant to say "use this account now" could not unblock it. A 429
+  that raced the switch is still preserved; one recorded earlier is not
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- The runtime proxy drops the switched account's cached quota observations when
+  it observes a new selection generation. It previously cleared session affinity
+  and nothing else, so a pre-switch reading kept driving preemptive deferrals
+  against the account just selected
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- A failed debounced save re-arms with backoff and a bounded retry count. The
+  debounce timer clears itself before the save runs, so one transient failure,
+  such as a Windows antivirus scanner holding `accounts.json` open, silently
+  discarded every rate-limit window, cooldown and rotated refresh token recorded
+  since the last successful write
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- `flushPendingSave()` logs a failure and resolves instead of rejecting.
+  `RuntimeRotationProxy.close` awaits it with no catch, so a save failure during
+  teardown aborted the rest of proxy shutdown
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- Every reader of `affinityGeneration`, and the increment itself, now require a
+  safe integer. The counter is how a running proxy notices a selection change,
+  and past 2^53 `Math.max(counter, disk) + 1` equals the counter, so one hand
+  edit or corrupted write to a 16-digit value froze it: each later switch wrote
+  the same number and no proxy ever observed another selection change. A poisoned
+  counter is dropped, so the next write repairs it to 1
+
 ## [2.12.0] - 2026-09-04
 
 Effort suffixes resolve to one key per model, usage is priced by service tier instead of assuming standard rates, and a class of lookup defect where a prototype member name was mistaken for a model id is closed. [Full notes](docs/releases/v2.12.0.md).
