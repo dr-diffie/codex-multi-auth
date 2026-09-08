@@ -170,6 +170,51 @@ let warnedShadowHomeSqliteLinkFailure = false;
 const warnedShadowHomeLinkOnlyDirectoryFailures = new Set();
 const warnedShadowHomeSqliteSidecarPlaceholderFailures = new Set();
 
+/**
+ * True only for a NUMERIC loopback literal, as `new URL().hostname` reports it.
+ *
+ * A name is deliberately not enough. `localhost` is resolved by the OS at
+ * connect time, so an /etc/hosts or Windows hosts entry can point it at a
+ * routable address, and the upstream request carries the managed OAuth bearer
+ * token and the request body. WHATWG URL always reports an IPv6 host in its
+ * bracketed form, so `::1` is only ever seen here as `[::1]`.
+ */
+function isLoopbackUrlHostname(hostname) {
+	if (hostname === "[::1]") {
+		return true;
+	}
+	const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+	if (!ipv4) {
+		return false;
+	}
+	const octets = ipv4.slice(1).map((part) => Number(part));
+	if (octets.some((octet) => !Number.isInteger(octet) || octet > 255)) {
+		return false;
+	}
+	// The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+	return octets[0] === 127;
+}
+
+/**
+ * Whether the raw URL text carries an explicit `:port`.
+ *
+ * `new URL()` erases a port that matches the scheme default, so
+ * `http://127.0.0.1:80/x` reports `parsed.port === ""` and a `!parsed.port`
+ * check would reject a perfectly valid, explicitly-ported loopback URL.
+ */
+function hasExplicitUrlPort(raw) {
+	const withoutScheme = raw.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "");
+	const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? "";
+	// Strip userinfo first, or a password containing ':' reads as a port.
+	const hostAndPort = authority.slice(authority.lastIndexOf("@") + 1);
+	if (hostAndPort.startsWith("[")) {
+		const close = hostAndPort.indexOf("]");
+		return close !== -1 && /^:\d+$/.test(hostAndPort.slice(close + 1));
+	}
+	const colon = hostAndPort.indexOf(":");
+	return colon !== -1 && /^:\d+$/.test(hostAndPort.slice(colon));
+}
+
 function resolveRuntimeRotationProxyUpstreamBaseUrl(env = process.env) {
 	const raw = (env[RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV] ?? "").trim();
 	if (!raw) {
@@ -185,31 +230,30 @@ function resolveRuntimeRotationProxyUpstreamBaseUrl(env = process.env) {
 		);
 	}
 
-	const hostname = parsed.hostname.toLowerCase();
-	const loopback =
-		hostname === "127.0.0.1" ||
-		hostname === "localhost" ||
-		hostname === "[::1]" ||
-		hostname === "::1";
 	if (
 		parsed.protocol !== "http:" ||
-		!loopback ||
-		!parsed.port ||
+		!isLoopbackUrlHostname(parsed.hostname.toLowerCase()) ||
+		!(parsed.port || hasExplicitUrlPort(raw)) ||
 		parsed.username ||
 		parsed.password ||
 		parsed.search ||
 		parsed.hash
 	) {
 		throw new Error(
-			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must use loopback HTTP with an explicit port and no credentials, query, or fragment.`,
+			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must use HTTP with a numeric loopback host (127.0.0.0/8 or [::1]; a name such as "localhost" is not accepted because it can resolve off-host), an explicit port, and no credentials, query, or fragment.`,
 		);
 	}
 
 	return parsed.toString().replace(/\/$/, "");
 }
 
-function createRuntimeRotationProxyOptions(clientApiKey, env = process.env) {
-	const upstreamBaseUrl = resolveRuntimeRotationProxyUpstreamBaseUrl(env);
+/**
+ * @param clientApiKey Shared secret the wrapper and proxy authenticate with.
+ * @param upstreamBaseUrl Already-resolved upstream, or undefined for the
+ * default backend. Callers pass the value they resolved rather than the env, so
+ * one launch never parses (and never re-reports) the same variable twice.
+ */
+function createRuntimeRotationProxyOptions(clientApiKey, upstreamBaseUrl) {
 	return upstreamBaseUrl
 		? { clientApiKey, upstreamBaseUrl }
 		: { clientApiKey };
@@ -4759,7 +4803,10 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 		}
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
 		proxyServer = await proxyModule.startRuntimeRotationProxy(
-			createRuntimeRotationProxyOptions(clientApiKey),
+			createRuntimeRotationProxyOptions(
+				clientApiKey,
+				resolveRuntimeRotationProxyUpstreamBaseUrl(),
+			),
 		);
 		const useCanonicalHome =
 			(process.env[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV] ?? "").trim() ===
@@ -5161,11 +5208,13 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	baseContext,
 	rawArgs,
 ) {
-	const enabled = await isRuntimeRotationProxyEnabled(rawArgs, baseContext.env);
-	if (!enabled) {
-		return baseContext;
-	}
-
+	// Resolve the configured upstream BEFORE the enabled gate. Every path that
+	// leaves this function with `baseContext` forwards Responses traffic, and its
+	// managed OAuth bearer token, straight to the real backend. An explicit
+	// upstream is a routing requirement rather than a rotation preference, so
+	// `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`, `CODEX_MULTI_AUTH_BYPASS=1`, a
+	// missing `dist/lib/config.js` or a disabled setting must all fail closed
+	// here instead of silently reaching chatgpt.com.
 	let configuredUpstreamBaseUrl;
 	try {
 		configuredUpstreamBaseUrl =
@@ -5178,7 +5227,23 @@ async function createRuntimeRotationProxyContextIfEnabled(
 			}`,
 		};
 	}
-	const requireConfiguredUpstream = configuredUpstreamBaseUrl !== undefined;
+	// The one exception is a subcommand that never reaches the backend at all
+	// (`--version`, `login`, ...): there is no traffic to misroute, so it passes
+	// through with the upstream simply unused.
+	const requireConfiguredUpstream =
+		configuredUpstreamBaseUrl !== undefined &&
+		shouldUseRuntimeRoutingForForwardedArgs(rawArgs);
+
+	const enabled = await isRuntimeRotationProxyEnabled(rawArgs, baseContext.env);
+	if (!enabled) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation is disabled, so ${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} cannot be honored and requests would go to the direct backend instead. Enable runtime rotation or unset that variable.`,
+			};
+		}
+		return baseContext;
+	}
 
 	const configTomlModule = await loadRuntimeConfigTomlModule();
 	if (!configTomlModule) {
@@ -5276,7 +5341,10 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	try {
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
 		proxyServer = await proxyModule.startRuntimeRotationProxy(
-			createRuntimeRotationProxyOptions(clientApiKey, baseContext.env),
+			createRuntimeRotationProxyOptions(
+				clientApiKey,
+				configuredUpstreamBaseUrl,
+			),
 		);
 		shadowContext = createRuntimeRotationProxyCodexHome(
 			baseContext.env,

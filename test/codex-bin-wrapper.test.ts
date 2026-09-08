@@ -1681,11 +1681,127 @@ describe("codex bin wrapper", () => {
 	);
 
 	it.each([
+		// An explicit default port is still an explicit port: `new URL()` erases
+		// it, so the resolved value drops back to the canonical form.
+		[
+			"http://127.0.0.1:80/backend-api",
+			"http://127.0.0.1/backend-api",
+		],
+		// The whole 127.0.0.0/8 block is loopback, not only 127.0.0.1.
+		[
+			"http://127.9.9.9:8787/backend-api",
+			"http://127.9.9.9:8787/backend-api",
+		],
+		["http://[::1]:8787/backend-api", "http://[::1]:8787/backend-api"],
+	])(
+		"accepts the loopback runtime-proxy upstream %s",
+		async (upstream, expectedForwarded) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, ["exec", "status"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL: upstream,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM: "1",
+			});
+
+			expect(result.status).toBe(0);
+			await waitForFileText(
+				markerPath,
+				[
+					`upstream:${expectedForwarded}`,
+					"start:http://127.0.0.1:4567",
+					"close",
+					"",
+				].join("\n"),
+			);
+		},
+	);
+
+	it("fails closed when runtime rotation is off but an upstream is configured", () => {
+		// Regression: the upstream used to be resolved only AFTER the enabled
+		// gate, so with rotation disabled the wrapper silently talked to the real
+		// backend while the operator believed traffic was pinned to their local
+		// listener.
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+				"http://127.0.0.1:8787/backend-api",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+
+		expect(result.status).toBe(1);
+		expect(combinedOutput(result)).toContain(
+			"codex-multi-auth runtime rotation is disabled",
+		);
+		expect(result.stdout).not.toContain("FORWARDED:");
+	});
+
+	it("still runs a non-request subcommand when an upstream is configured", () => {
+		// `--version` never reaches the backend, so there is no traffic to
+		// misroute and the configured upstream is simply unused.
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["--version"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+				"http://127.0.0.1:8787/backend-api",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("FORWARDED:");
+	});
+
+	it.each([
 		"https://127.0.0.1:8787/backend-api",
 		"http://example.com:8787/backend-api",
 		"http://127.0.0.1/backend-api",
 		"http://user:pass@127.0.0.1:8787/backend-api",
 		"http://127.0.0.1:8787/backend-api?route=unsafe",
+		"http://127.0.0.1:8787/backend-api#unsafe",
+		// A name is not a loopback guarantee: a hosts-file entry can point
+		// `localhost` at a routable address and the upstream request carries the
+		// managed OAuth bearer token.
+		"http://localhost:8787/backend-api",
+		"http://127.0.0.1.example.com:8787/backend-api",
+		"http://[::2]:8787/backend-api",
 		"not-a-url",
 	])("fails closed for an unsafe runtime-proxy upstream: %s", (upstream) => {
 		const fixtureRoot = createWrapperFixture();
