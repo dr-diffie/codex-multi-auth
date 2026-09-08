@@ -232,8 +232,76 @@ describe("runLimitsCommand", () => {
 			schemaVersion: 1,
 			generatedAt: NOW,
 			mode: "cached",
+			selection: {
+				pinnedIndex: null,
+				routedIndex: 0,
+				activeIndexByFamily: {},
+			},
 			accounts: [],
 		});
+	});
+
+	it("marks the pinned account current, not the family active index", async () => {
+		// Regression: `current` was derived from the codex active index alone, so
+		// any flow that moves the active index without touching the `switch` pin
+		// (rotation saves, unpin, an ephemeral --account) reported `current: true`
+		// on a row the runtime proxy is not serving from.
+		const deps = createDeps();
+		const storage = accountStorageV3Fixture([
+			storageAccountFixture({ accountId: "acct-1", email: "one@example.com" }),
+			storageAccountFixture({ accountId: "acct-2", email: "two@example.com" }),
+		]);
+		storage.pinnedAccountIndex = 1;
+		deps.loadAccounts.mockResolvedValueOnce(storage);
+		deps.resolveActiveIndex.mockReturnValue(0);
+
+		expect(await runLimitsCommand(["--json"], deps)).toBe(0);
+
+		const payload = emittedJson(deps);
+		expect(payload.selection).toMatchObject({
+			pinnedIndex: 1,
+			routedIndex: 1,
+		});
+		const accounts = payload.accounts as Array<Record<string, unknown>>;
+		expect(accounts.map((account) => account.current)).toEqual([false, true]);
+	});
+
+	it("reports the per-family active index and ignores an out-of-range pin", async () => {
+		const deps = createDeps();
+		const storage = accountStorageV3Fixture([
+			storageAccountFixture({ accountId: "acct-1", email: "one@example.com" }),
+			storageAccountFixture({ accountId: "acct-2", email: "two@example.com" }),
+		]);
+		storage.pinnedAccountIndex = 9;
+		deps.loadAccounts.mockResolvedValueOnce(storage);
+		deps.resolveActiveIndex.mockImplementation((_storage, family) =>
+			family === "codex" ? 1 : 0,
+		);
+
+		expect(await runLimitsCommand(["--json"], deps)).toBe(0);
+
+		const selection = emittedJson(deps).selection as {
+			pinnedIndex: number | null;
+			routedIndex: number;
+			activeIndexByFamily: Record<string, number>;
+		};
+		expect(selection.pinnedIndex).toBeNull();
+		expect(selection.routedIndex).toBe(1);
+		expect(selection.activeIndexByFamily.codex).toBe(1);
+		expect(Object.keys(selection.activeIndexByFamily).length).toBeGreaterThan(1);
+	});
+
+	it("masks account emails in the emitted label", async () => {
+		// `limits --json` is meant to be piped into logs, dashboards and tickets,
+		// so it masks addresses the same way `forecast --json` does.
+		const deps = createDeps();
+
+		expect(await runLimitsCommand(["--json"], deps)).toBe(0);
+
+		const serialized = JSON.stringify(emittedJson(deps));
+		expect(serialized).not.toContain("one@example.com");
+		expect(serialized).not.toContain("two@example.com");
+		expect(serialized).toContain("on***@***.com");
 	});
 
 	it("prints focused help without reading account storage", async () => {

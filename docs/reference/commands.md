@@ -101,16 +101,23 @@ by the consumer from `resetAtMs`; the command emits numeric values rather than
 locale-formatted dates.
 
 The top-level object has `schemaVersion: 1`, a millisecond `generatedAt`, a
-`mode` of `cached` or `refresh` describing the requested command mode, and
-`accounts`. Each configured account includes
+`mode` of `cached` or `refresh` describing the requested command mode,
+`selection`, and `accounts`. Each configured account includes
 `index`, `label`, `enabled`, `current`, and either a `quota` object or `null`.
 Quota objects contain `updatedAt`, HTTP `status`, `planType`, and `primary` /
 `secondary` windows with `usedPercent`, `windowMinutes`, and `resetAtMs`.
 Unavailable provider values are explicit JSON `null`; internal probe-model names,
-credentials, and orphan cache entries are not emitted.
+credentials, and orphan cache entries are not emitted. Account emails are masked
+inside `label` the same way `forecast --json` masks them.
 
-`--json` is required. `--help` / `-h` prints focused usage. Unknown flags fail
-with exit code 1 without reading account storage or quota cache.
+`selection` reports how the routed account was chosen: `pinnedIndex` is the
+`switch` pin or `null`, `activeIndexByFamily` is the per-family active index,
+and `routedIndex` is the account the runtime proxy actually serves from
+(`pinnedIndex` when a pin is set, otherwise the `codex` active index). An
+account's `current` is true when its `index` equals `routedIndex`.
+
+`--json` (`-j`) is required. `--help` / `-h` prints focused usage. Unknown flags
+fail with exit code 1 without reading account storage or quota cache.
 
 ---
 

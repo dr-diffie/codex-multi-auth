@@ -1,6 +1,8 @@
 import { formatAccountLabel } from "../../accounts.js";
+import { MODEL_FAMILIES, type ModelFamily } from "../../prompts/codex.js";
 import { findQuotaCacheEntryForAccount } from "../../quota-readiness.js";
 import type { QuotaCacheData, QuotaCacheEntry } from "../../quota-cache.js";
+import { redactEmails } from "../../redaction.js";
 import type { AccountStorageV3 } from "../../storage.js";
 
 const LIMITS_SCHEMA_VERSION = 1;
@@ -16,7 +18,10 @@ export interface LimitsCommandDeps {
 		cache: QuotaCacheData,
 		maxAgeMs: number,
 	) => Promise<QuotaCacheData>;
-	resolveActiveIndex: (storage: AccountStorageV3, family?: "codex") => number;
+	resolveActiveIndex: (
+		storage: AccountStorageV3,
+		family?: ModelFamily,
+	) => number;
 	getNow?: () => number;
 	logInfo?: (message: string) => void;
 	logError?: (message: string) => void;
@@ -106,6 +111,13 @@ export async function runLimitsCommand(
 					schemaVersion: LIMITS_SCHEMA_VERSION,
 					generatedAt,
 					mode: parsed.options.refresh ? "refresh" : "cached",
+					// Keep the key set identical for an empty pool so a consumer
+					// never has to branch on its presence.
+					selection: {
+						pinnedIndex: null,
+						routedIndex: 0,
+						activeIndexByFamily: {},
+					},
 					accounts: [],
 				},
 				null,
@@ -125,7 +137,7 @@ export async function runLimitsCommand(
 	}
 
 	const generatedAt = deps.getNow?.() ?? Date.now();
-	const activeIndex = deps.resolveActiveIndex(storage, "codex");
+	const selection = resolveSelection(storage, deps.resolveActiveIndex);
 	const accounts = storage.accounts.map((account, index) => {
 		const quota = findQuotaCacheEntryForAccount(
 			cache,
@@ -134,9 +146,12 @@ export async function runLimitsCommand(
 		);
 		return {
 			index,
-			label: formatAccountLabel(account, index),
+			// Labels are built from the account email. Mask it, exactly as
+			// `forecast --json` already does, so a snapshot written to a log
+			// shipper or a ticket does not carry the address.
+			label: redactEmails(formatAccountLabel(account, index)),
 			enabled: account.enabled !== false,
-			current: index === activeIndex,
+			current: index === selection.routedIndex,
 			quota: quota ? publicQuotaEntry(quota) : null,
 		};
 	});
@@ -147,6 +162,7 @@ export async function runLimitsCommand(
 				schemaVersion: LIMITS_SCHEMA_VERSION,
 				generatedAt,
 				mode: parsed.options.refresh ? "refresh" : "cached",
+				selection,
 				accounts,
 			},
 			null,
@@ -154,4 +170,42 @@ export async function runLimitsCommand(
 		),
 	);
 	return 0;
+}
+
+/**
+ * Which account actually serves traffic, and the state that decides it.
+ *
+ * `current` cannot be `activeIndexByFamily.codex` alone. The runtime proxy
+ * routes on `pinnedAccountIndex` whenever a `switch` pin is set, and flows that
+ * move the active index without touching the pin (rotation saves, `unpin`, an
+ * ephemeral `--account`) would otherwise leave `current: true` on a row that is
+ * not serving anything. Both inputs are emitted so a consumer can tell which
+ * one applied, and the per-family map is emitted because a pool can hold a
+ * different active index per family.
+ */
+function resolveSelection(
+	storage: AccountStorageV3,
+	resolveActiveIndex: LimitsCommandDeps["resolveActiveIndex"],
+): {
+	pinnedIndex: number | null;
+	routedIndex: number;
+	activeIndexByFamily: Partial<Record<ModelFamily, number>>;
+} {
+	const activeIndexByFamily: Partial<Record<ModelFamily, number>> = {};
+	for (const family of MODEL_FAMILIES) {
+		activeIndexByFamily[family] = resolveActiveIndex(storage, family);
+	}
+	const rawPin = storage.pinnedAccountIndex;
+	const pinnedIndex =
+		typeof rawPin === "number" &&
+		Number.isInteger(rawPin) &&
+		rawPin >= 0 &&
+		rawPin < storage.accounts.length
+			? rawPin
+			: null;
+	return {
+		pinnedIndex,
+		routedIndex: pinnedIndex ?? activeIndexByFamily.codex ?? 0,
+		activeIndexByFamily,
+	};
 }
