@@ -193,14 +193,20 @@ const PINNED_PERMANENT_SKIP_REASONS: ReadonlySet<string> = new Set([
 const DEFAULT_QUOTA_REMAINING_THRESHOLD = 10;
 
 /** @internal Stable identity key for in-memory quota snapshots across reloads. */
-export function buildQuotaScheduleKey(
+/**
+ * Quota-scheduler key prefix identifying ONE account across every family and
+ * model key it owns.
+ *
+ * The trailing separator is part of the contract: without it the prefix
+ * `account:email:foo` also matches `account:email:foobar:codex`, so clearing
+ * one account's observations would silently clear a neighbour's.
+ */
+export function buildQuotaScheduleAccountPrefix(
 	account: Pick<ManagedAccount, "accountId" | "email" | "refreshToken"> & {
 		/** Stable per-record discriminator retained across token/account-id updates. */
 		addedAt?: number;
 		recordId?: string;
 	},
-	family: ModelFamily,
-	model?: string | null,
 ): string {
 	const emailKey = normalizeEmailKey(account.email);
 	const accountId = account.accountId?.trim();
@@ -219,7 +225,19 @@ export function buildQuotaScheduleKey(
 		: accountId
 			? `id:${accountId}${recordDiscriminator}`
 			: `refresh:${createHash("sha256").update(refreshToken).digest("hex")}${recordDiscriminator}`;
-	return `account:${accountIdentity}:${model ?? family}`;
+	return `account:${accountIdentity}:`;
+}
+
+export function buildQuotaScheduleKey(
+	account: Pick<ManagedAccount, "accountId" | "email" | "refreshToken"> & {
+		/** Stable per-record discriminator retained across token/account-id updates. */
+		addedAt?: number;
+		recordId?: string;
+	},
+	family: ModelFamily,
+	model?: string | null,
+): string {
+	return `${buildQuotaScheduleAccountPrefix(account)}${model ?? family}`;
 }
 
 const DEFAULT_MAX_RUNTIME_ACCOUNT_ATTEMPTS = 4;
@@ -1144,7 +1162,38 @@ async function handleRequestInner(
 		// otherwise glue an in-flight chat thread to the previously selected
 		// account. The proxy itself never bumps the generation, so its own
 		// debounced disk writes do not clear affinity. See issue #474.
-		const storageMeta = readStorageMetaFromDisk();
+		/** Reconcile once before selection or recording a new upstream observation. */
+		const reconcileManualSelection = () => {
+			const meta = readStorageMetaFromDisk();
+			for (const manager of state.knownAccountManagers) {
+				manager.applyManualSelection(meta);
+			}
+			if (meta.affinityGeneration > state.lastObservedAffinityGeneration) {
+				const switchedAccount = meta.pinnedAccountIndex === null
+					? null
+					: accountManager.getAccountByIndex(meta.pinnedAccountIndex);
+				if (switchedAccount) {
+					state.preemptiveQuotaScheduler.clearByPrefix(
+						buildQuotaScheduleAccountPrefix(switchedAccount),
+					);
+				} else if (meta.pinnedAccountIndex !== null) {
+					// A pin we cannot resolve: this long-lived proxy re-reads only
+					// pin/gen, never the account list, so a `login` that appended an
+					// account before the `switch` leaves the new index out of range
+					// here. The generation only bumps on the NEXT user-initiated
+					// switch, so skipping the clear and advancing anyway would strand
+					// the pre-switch quota observation forever, which is the exact
+					// deferral this reconciliation exists to end. Drop every cached
+					// observation instead: it only costs a re-probe, and real 429
+					// windows live on the accounts themselves, not in this cache.
+					state.preemptiveQuotaScheduler.clearAll();
+				}
+				state.sessionAffinityStore?.clearAll();
+				state.lastObservedAffinityGeneration = meta.affinityGeneration;
+			}
+			return meta;
+		};
+		const storageMeta = reconcileManualSelection();
 		// The ephemeral --account pin (issue #623) takes precedence over the
 		// persisted `switch` pin for this invocation, without ever mutating disk
 		// state. Use `??` (not `||`) so a forced index of 0 is honored. When set,
@@ -1182,10 +1231,6 @@ async function handleRequestInner(
 				1,
 				Math.min(state.maxRuntimeAccountAttempts, MAX_PINNED_TRANSIENT_ATTEMPTS),
 			);
-		}
-		if (storageMeta.affinityGeneration > state.lastObservedAffinityGeneration) {
-			state.sessionAffinityStore?.clearAll();
-			state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
 		}
 
 		let runtimeSelectionIterations = 0;
@@ -1499,6 +1544,7 @@ async function handleRequestInner(
 				noteRotation();
 				continue;
 			}
+			reconcileManualSelection();
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
 				upstream.headers,
 				upstream.status,
@@ -1514,6 +1560,8 @@ async function handleRequestInner(
 					parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
 					parseRetryAfterBodyMs(bodyText, state.now()) ??
 					60_000;
+				// Reading the body awaited I/O; a switch may have landed meanwhile.
+				reconcileManualSelection();
 				state.preemptiveQuotaScheduler.markRateLimited(
 					quotaScheduleKey,
 					retryAfterMs,

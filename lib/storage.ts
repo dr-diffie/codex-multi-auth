@@ -1391,41 +1391,74 @@ export function bumpStorageAffinityGeneration(
  * persisting routine state (rate-limit hits, cooldowns, etc.) so a CLI
  * `switch`/`unpin` that landed between proxy startup and the save is not
  * clobbered. Returns `pinnedAccountIndex: undefined` and
- * `affinityGeneration: 0` on any failure. See issue #474.
+ * `affinityGeneration: 0` on any failure by default. See issue #474.
+ *
+ * `strict` callers additionally need to know when the metadata could not be
+ * OBSERVED AT ALL, because persisting a stale in-memory pin over a newer disk
+ * pin is exactly the #474 regression. Strict mode therefore throws for the two
+ * cases where a newer selection may be hiding behind the failure:
+ *   - the file exists but cannot be read (EBUSY/EPERM/EACCES: on Windows an AV
+ *     scanner or indexer can hold accounts.json open), and
+ *   - the bytes are not valid JSON (a torn read of a concurrent atomic write).
+ *
+ * A MISSING file and a successfully parsed file with INVALID field values are
+ * deliberately not failures, in either mode. Neither can be concealing a newer
+ * pin (there is no file, or we can see the whole file and the field is
+ * unusable), and both are self-repaired by the very write that follows. Making
+ * them throw would wedge persistence permanently, since recreating or repairing
+ * storage goes through the same save path, and it would take every rate-limit
+ * window, cooldown and rotated refresh token in memory down with it.
  */
-export function readPinAndGenFromDisk(path: string): {
+export function readPinAndGenFromDisk(
+	path: string,
+	options?: { strict?: boolean },
+): {
 	pinnedAccountIndex: number | undefined;
 	affinityGeneration: number;
 } {
+	const unselected = {
+		pinnedAccountIndex: undefined,
+		affinityGeneration: 0,
+	} as const;
 	if (!existsSync(path)) {
-		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
+		return { ...unselected };
 	}
+	let parsed: unknown;
 	try {
-		const bytes = readFileSync(path);
-		const parsed = JSON.parse(bytes.toString("utf8")) as {
-			pinnedAccountIndex?: unknown;
-			affinityGeneration?: unknown;
-		};
-		const rawPin = parsed.pinnedAccountIndex;
-		const pinnedAccountIndex =
-			typeof rawPin === "number" &&
-			Number.isFinite(rawPin) &&
-			Number.isInteger(rawPin) &&
-			rawPin >= 0
-				? rawPin
-				: undefined;
-		const rawGen = parsed.affinityGeneration;
-		const affinityGeneration =
-			typeof rawGen === "number" &&
-			Number.isFinite(rawGen) &&
-			Number.isInteger(rawGen) &&
-			rawGen >= 0
-				? rawGen
-				: 0;
-		return { pinnedAccountIndex, affinityGeneration };
-	} catch {
-		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		// The file was deleted or renamed between existsSync and the read; same
+		// reasoning as the missing-file branch above.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { ...unselected };
+		}
+		if (options?.strict) {
+			throw new Error("Unable to read account selection metadata", {
+				cause: error,
+			});
+		}
+		return { ...unselected };
 	}
+	if (!isRecord(parsed)) {
+		return { ...unselected };
+	}
+	const rawPin = parsed.pinnedAccountIndex;
+	const pinnedAccountIndex =
+		typeof rawPin === "number" &&
+		Number.isFinite(rawPin) &&
+		Number.isInteger(rawPin) &&
+		rawPin >= 0
+			? rawPin
+			: undefined;
+	const rawGen = parsed.affinityGeneration;
+	const affinityGeneration =
+		typeof rawGen === "number" &&
+		Number.isFinite(rawGen) &&
+		Number.isInteger(rawGen) &&
+		rawGen >= 0
+			? rawGen
+			: 0;
+	return { pinnedAccountIndex, affinityGeneration };
 }
 
 /**

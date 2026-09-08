@@ -121,6 +121,20 @@ export async function persistAndSyncSelectedAccount({
 	account.lastSwitchReason = switchReason;
 	if (setPin) {
 		storage.pinnedAccountIndex = targetIndex;
+		// A manual switch requests a fresh upstream attempt, including when
+		// reselecting the same account after an out-of-band quota reset. Real 429
+		// responses will populate these markers again.
+		//
+		// `setPin` is the right trigger because it is set only by `switch` (which
+		// the login dashboard's account picker also routes through), i.e. exactly
+		// the paths where a person picked this account. `best` passes `clearPin`
+		// and a backup restore passes neither, and neither of those is a request
+		// to revalidate a rate-limited account.
+		//
+		// Delete rather than assign `{}`: `AccountManager.buildStorageSnapshot`
+		// omits the field when the map is empty, so assigning would persist a
+		// second on-disk shape for the same state.
+		delete account.rateLimitResetTimes;
 	} else if (clearPin) {
 		delete storage.pinnedAccountIndex;
 	}

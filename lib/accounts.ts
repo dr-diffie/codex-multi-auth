@@ -273,6 +273,29 @@ export type { Workspace } from "./storage/public-types.js";
 /** Stable operator-facing marker for an explicitly invalidated OAuth token. */
 export const AUTH_INVALIDATION_MARKER = "token-invalid — re-login needed";
 
+/**
+ * How long a 429 recorded while the selection metadata was unreadable stays
+ * eligible to be replayed over a `switch` that clears the account's markers.
+ *
+ * The window only has to cover the gap between the CLI's atomic storage write
+ * and this process observing it, which is a single filesystem read away and in
+ * practice sub-second. 30s is generous for a stalled Windows volume while still
+ * guaranteeing that a 429 from minutes or hours earlier can never be
+ * resurrected by a later, unrelated switch.
+ */
+export const UNSEQUENCED_RATE_LIMIT_TTL_MS = 30_000;
+
+/**
+ * How many times a debounced save re-arms itself after a failure before giving
+ * up. A save can fail because the selection metadata was momentarily
+ * unreadable, and dropping it loses every rate-limit window, cooldown and
+ * rotated refresh token accumulated since the last successful save.
+ */
+export const MAX_DEBOUNCED_SAVE_RETRIES = 5;
+
+/** Ceiling for the debounced-save retry backoff. */
+export const MAX_SAVE_RETRY_DELAY_MS = 8_000;
+
 export interface ManagedAccount {
 	index: number;
 	recordId?: string;
@@ -315,6 +338,8 @@ export class AccountManager {
 	private lastToastTime = 0;
 	private saveDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 	private pendingSave: Promise<void> | null = null;
+	/** Consecutive debounced-save failures; reset by the next success. */
+	private saveRetryCount = 0;
 	private readonly storagePathState: StoragePathState;
 	/**
 	 * Manual pin set by the `switch` CLI command, hydrated from disk at
@@ -330,6 +355,21 @@ export class AccountManager {
 	 * as `pinnedAccountIndex`. See #474.
 	 */
 	private affinityGeneration: number;
+	// A 429 observed while the selection metadata was unreadable must survive
+	// the next reconciliation, because we cannot tell whether it landed before
+	// or after the `switch` that reconciliation is about to apply. Keep only
+	// those new markers, not the stale account map.
+	//
+	// `recordedAtMs` bounds that ambiguity. Only a 429 recorded within
+	// UNSEQUENCED_RATE_LIMIT_TTL_MS of the reconciliation could have raced the
+	// switch we are applying; an older entry provably predates it and must NOT
+	// be replayed, or an arbitrarily stale 429 would be resurrected by the very
+	// command meant to revalidate the account.
+	private readonly unsequencedRateLimits = new WeakMap<ManagedAccount, {
+		limits: RateLimitStateV3;
+		reason: RateLimitReason;
+		recordedAtMs: number;
+	}>();
 	/**
 	 * PR-N / R4: feature-flagged routing mutex mode.
 	 * Defaults to `"legacy"` to preserve pre-PR-N behaviour for one release
@@ -742,6 +782,42 @@ export class AccountManager {
 	static resetVolatileRuntimeState(): void {
 		resetTrackers();
 		resetAllCircuitBreakers();
+	}
+
+	/**
+	 * Apply each explicit selection once without erasing a subsequent 429.
+	 *
+	 * A `switch` asks for a fresh upstream attempt, so the selected account's
+	 * rate-limit markers are cleared. The only markers that survive that clear
+	 * are ones recorded while the selection metadata was unreadable AND recent
+	 * enough to have raced this switch (see UNSEQUENCED_RATE_LIMIT_TTL_MS); an
+	 * older unsequenced entry provably predates the switch and is discarded.
+	 *
+	 * @param meta Latest successfully read selection generation and pin.
+	 */
+	applyManualSelection(meta: {
+		pinnedAccountIndex?: number | null;
+		affinityGeneration: number;
+	}): void {
+		if (meta.affinityGeneration <= this.affinityGeneration) return;
+		const index = meta.pinnedAccountIndex;
+		const account = typeof index === "number"
+			? this.getAccountByIndex(index)
+			: null;
+		if (account) {
+			clearAllRateLimits(account);
+			const pending = this.unsequencedRateLimits.get(account);
+			const replayable =
+				pending !== undefined &&
+				nowMs() - pending.recordedAtMs <= UNSEQUENCED_RATE_LIMIT_TTL_MS
+					? pending
+					: undefined;
+			Object.assign(account.rateLimitResetTimes, replayable?.limits);
+			account.lastRateLimitReason = replayable?.reason;
+			this.unsequencedRateLimits.delete(account);
+		}
+		this.pinnedAccountIndex = account ? index ?? undefined : undefined;
+		this.affinityGeneration = meta.affinityGeneration;
 	}
 
 	/**
@@ -1267,18 +1343,47 @@ export class AccountManager {
 		reason: RateLimitReason,
 		model?: string | null,
 	): void {
+		let selectionReadable = false;
+		try {
+			// Deliberately a fresh strict read rather than the proxy's cached
+			// `readStorageMetaFromDisk`: that reader falls back to its last good
+			// snapshot on failure, so it cannot tell this call site the one thing
+			// it needs to know, namely whether the selection was observable at all.
+			const meta = readPinAndGenFromDisk(this.resolveSelectionStoragePath(), {
+				strict: true,
+			});
+			// Observe a switch BEFORE recording this response, not at the later
+			// debounced save where it would erase a genuine post-switch 429.
+			this.applyManualSelection(meta);
+			selectionReadable = true;
+		} catch {
+			// Fail closed: retain this new limit if the selection cannot be read.
+			log.warn("Rate limit recorded while account selection metadata is unavailable");
+		}
 		// Clamp to MAX_RATE_LIMIT_DELAY_MS so a bogus upstream retry-after value
 		// cannot wedge this account unavailable for years (see stress audit H1).
 		const retryMs = Math.min(
 			Math.max(0, Math.floor(retryAfterMs)),
 			MAX_RATE_LIMIT_DELAY_MS,
 		);
-		const resetAt = nowMs() + retryMs;
+		const observedAtMs = nowMs();
+		const resetAt = observedAtMs + retryMs;
+		// Only carry forward an unsequenced entry that is still replayable.
+		// Merging an expired one would give it a fresh `recordedAtMs` below and
+		// keep resurrecting it indefinitely.
+		const pending = this.unsequencedRateLimits.get(account);
+		const carried =
+			pending !== undefined &&
+			observedAtMs - pending.recordedAtMs <= UNSEQUENCED_RATE_LIMIT_TTL_MS
+				? pending
+				: undefined;
+		const newLimits: RateLimitStateV3 = { ...carried?.limits };
 
 		const baseKey = getQuotaKey(family);
 		if (!model || reason === "quota" || reason === "unknown") {
 			const currentResetAt = account.rateLimitResetTimes[baseKey] ?? 0;
 			account.rateLimitResetTimes[baseKey] = Math.max(currentResetAt, resetAt);
+			newLimits[baseKey] = Math.max(newLimits[baseKey] ?? 0, resetAt);
 		}
 
 		if (
@@ -1288,9 +1393,32 @@ export class AccountManager {
 			const modelKey = getQuotaKey(family, model);
 			const currentResetAt = account.rateLimitResetTimes[modelKey] ?? 0;
 			account.rateLimitResetTimes[modelKey] = Math.max(currentResetAt, resetAt);
+			newLimits[modelKey] = Math.max(newLimits[modelKey] ?? 0, resetAt);
 		}
 
 		account.lastRateLimitReason = reason;
+		if (!selectionReadable) {
+			this.unsequencedRateLimits.set(account, {
+				limits: newLimits,
+				reason,
+				recordedAtMs: observedAtMs,
+			});
+		} else {
+			// The selection was observable, so this 429 is unambiguously ordered
+			// against the current generation and needs no replay backup.
+			this.unsequencedRateLimits.delete(account);
+		}
+	}
+
+	/**
+	 * Storage file this manager owns, resolved through the path state captured
+	 * at construction. Reading the ambient `getStoragePath()` instead would
+	 * point a project-scoped pool at whichever storage file happens to be
+	 * current on the calling async context. See `saveToDisk`, which wraps
+	 * `runWithStoragePathState(this.storagePathState, ...)` for the same reason.
+	 */
+	private resolveSelectionStoragePath(): string {
+		return this.storagePathState.currentStoragePath ?? getStoragePath();
 	}
 
 	markAccountCoolingDown(
@@ -1481,6 +1609,57 @@ export class AccountManager {
 		return snapshot;
 	}
 
+	/**
+	 * Re-read the on-disk selection and fold it into this manager's state.
+	 *
+	 * Race protection: a CLI `switch`/`unpin`/`best` may have written a NEW
+	 * pin/gen between proxy startup (or the last save) and now. If we persisted
+	 * our stale instance values, we'd silently clobber the CLI update on every
+	 * routine save (rate-limit, cooldown, near-quota refund, etc.). See #474.
+	 *
+	 * This MUTATES `pinnedAccountIndex`, `affinityGeneration` and, when the
+	 * generation advanced, the selected account's rate-limit markers, so it is a
+	 * separate step from the pure `buildStorageSnapshot` serializer below rather
+	 * than a hidden side effect of it. Callers must run it immediately before a
+	 * snapshot they intend to persist. Applying it twice is a no-op.
+	 *
+	 * @throws when the metadata exists but cannot be observed (see
+	 * `readPinAndGenFromDisk`), which is the one case where persisting would
+	 * risk overwriting a newer pin.
+	 */
+	private reconcileSelectionFromDisk(): void {
+		const onDisk = readPinAndGenFromDisk(this.resolveSelectionStoragePath(), {
+			strict: true,
+		});
+		// A delayed save must not resurrect the markers the CLI just cleared.
+		this.applyManualSelection(onDisk);
+		let effectivePinnedAccountIndex = this.pinnedAccountIndex;
+		let effectiveAffinityGeneration = this.affinityGeneration;
+		if (onDisk.affinityGeneration > effectiveAffinityGeneration) {
+			effectiveAffinityGeneration = onDisk.affinityGeneration;
+			// The pin is part of the same atomic write the CLI performs when it
+			// bumps the generation, so a strictly-greater on-disk gen is the
+			// signal that the disk pin is the authoritative one.
+			effectivePinnedAccountIndex = onDisk.pinnedAccountIndex;
+		}
+		// Validate the refreshed pin against the live account count.
+		if (
+			effectivePinnedAccountIndex !== undefined &&
+			(effectivePinnedAccountIndex < 0 ||
+				effectivePinnedAccountIndex >= this.accounts.length)
+		) {
+			effectivePinnedAccountIndex = undefined;
+		}
+		// Cache the refreshed values so subsequent saves start from the freshest
+		// known state without re-reading every time.
+		this.pinnedAccountIndex = effectivePinnedAccountIndex;
+		this.affinityGeneration = effectiveAffinityGeneration;
+	}
+
+	/**
+	 * Serialize the live pool. Pure: it reads no files and mutates no state.
+	 * Persisting callers must call `reconcileSelectionFromDisk()` first.
+	 */
 	private buildStorageSnapshot(): AccountStorageV3 {
 		const activeIndexByFamily: Partial<Record<ModelFamily, number>> = {};
 		for (const family of MODEL_FAMILIES) {
@@ -1489,40 +1668,8 @@ export class AccountManager {
 		}
 
 		const activeIndex = clampNonNegativeInt(activeIndexByFamily.codex, 0);
-
-		// Race protection: a CLI `switch`/`unpin`/`best` may have written a NEW
-		// pin/gen between proxy startup (or the last save) and now. If we
-		// persisted our stale instance values, we'd silently clobber the CLI
-		// update on every routine save (rate-limit, cooldown, near-quota refund,
-		// etc.). Re-read just before snapshotting and prefer the fresher value.
-		// See #474.
-		let effectivePinnedAccountIndex = this.pinnedAccountIndex;
-		let effectiveAffinityGeneration = this.affinityGeneration;
-		try {
-			const onDisk = readPinAndGenFromDisk(getStoragePath());
-			if (onDisk.affinityGeneration > effectiveAffinityGeneration) {
-				effectiveAffinityGeneration = onDisk.affinityGeneration;
-				// The pin is part of the same atomic write the CLI performs when
-				// it bumps the generation, so a strictly-greater on-disk gen is
-				// the signal that the disk pin is the authoritative one.
-				effectivePinnedAccountIndex = onDisk.pinnedAccountIndex;
-			}
-			// Validate the refreshed pin against the live account count.
-			if (
-				effectivePinnedAccountIndex !== undefined &&
-				(effectivePinnedAccountIndex < 0 ||
-					effectivePinnedAccountIndex >= this.accounts.length)
-			) {
-				effectivePinnedAccountIndex = undefined;
-			}
-			// Cache the refreshed values so subsequent saves start from the
-			// freshest known state without re-reading every time.
-			this.pinnedAccountIndex = effectivePinnedAccountIndex;
-			this.affinityGeneration = effectiveAffinityGeneration;
-		} catch {
-			// Disk read failures fall back to in-memory values; better than
-			// dropping the snapshot save entirely.
-		}
+		const effectivePinnedAccountIndex = this.pinnedAccountIndex;
+		const effectiveAffinityGeneration = this.affinityGeneration;
 
 		const snapshot: AccountStorageV3 = {
 			version: 3,
@@ -1582,7 +1729,11 @@ export class AccountManager {
 		try {
 			return await withAccountStorageTransaction(async (_current, persist) => {
 				// Snapshot the live in-memory pool under the storage lock so refresh
-				// persistence merges against the latest account state.
+				// persistence merges against the latest account state. Reconcile the
+				// selection first for the same reason `saveToDisk` does: this write
+				// carries `pinnedAccountIndex`/`affinityGeneration` too, so a stale
+				// pair here would clobber a `switch` that landed since the last save.
+				this.reconcileSelectionFromDisk();
 				const nextStorage = structuredClone(
 					this.buildStorageSnapshot(),
 				) as AccountStorageV3;
@@ -1998,7 +2149,8 @@ export class AccountManager {
 			await withAccountStorageTransaction(async (current, persist) => {
 				// Reconcile against the disk state loaded under the storage lock so a
 				// routine save does not clobber a token another process just rotated
-				// (stress audit H3).
+				// (stress audit H3) or a pin the CLI just wrote (#474).
+				this.reconcileSelectionFromDisk();
 				await persist(
 					this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current),
 				);
@@ -2021,24 +2173,56 @@ export class AccountManager {
 						this.pendingSave = null;
 					});
 					await this.pendingSave;
+					this.saveRetryCount = 0;
 				} catch (error) {
 					log.warn("Debounced save failed", {
 						error: error instanceof Error ? error.message : String(error),
+						attempt: this.saveRetryCount + 1,
 					});
+					// The debounce timer has already fired and cleared itself, so
+					// without re-arming this save is simply lost, and with it every
+					// rate-limit window, cooldown and rotated refresh token recorded
+					// since the last successful write. Saves fail for transient
+					// reasons (a Windows AV scanner or indexer holding accounts.json,
+					// a torn read of a concurrent atomic rename), so back off and try
+					// again instead of dropping the state.
+					if (this.saveRetryCount < MAX_DEBOUNCED_SAVE_RETRIES) {
+						this.saveRetryCount += 1;
+						this.saveToDiskDebounced(
+							Math.min(delayMs * 2, MAX_SAVE_RETRY_DELAY_MS),
+						);
+					} else {
+						this.saveRetryCount = 0;
+						log.error(
+							"Dropping account state save after repeated failures; runtime state since the last successful save is lost",
+						);
+					}
 				}
 			};
 			void doSave();
 		}, delayMs);
 	}
 
+	/**
+	 * Flush any debounced save. Never rejects: this runs on the proxy shutdown
+	 * path (`RuntimeRotationProxy.close`), and a rejection there aborts the rest
+	 * of the teardown. A failure is logged at error level instead, because the
+	 * process is exiting and there is no later attempt to fall back to.
+	 */
 	async flushPendingSave(): Promise<void> {
-		if (this.saveDebounceTimer) {
-			clearTimeout(this.saveDebounceTimer);
-			this.saveDebounceTimer = null;
-			await this.saveToDisk();
-		}
-		if (this.pendingSave) {
-			await this.pendingSave;
+		try {
+			if (this.saveDebounceTimer) {
+				clearTimeout(this.saveDebounceTimer);
+				this.saveDebounceTimer = null;
+				await this.saveToDisk();
+			}
+			if (this.pendingSave) {
+				await this.pendingSave;
+			}
+		} catch (error) {
+			log.error("Failed to flush pending account state save", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 

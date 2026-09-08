@@ -338,6 +338,27 @@ export class PreemptiveQuotaScheduler {
 		return { defer: false, waitMs: 0 };
 	}
 
+	/**
+	 * Forget cached quota observations for one account across its model keys.
+	 *
+	 * @param prefix Account key INCLUDING its trailing separator, as produced by
+	 * `buildQuotaScheduleAccountPrefix`. Without that separator the prefix also
+	 * matches neighbouring identities (`account:email:foo` matches
+	 * `account:email:foobar:codex`). An empty prefix is a no-op rather than a
+	 * silent clear-all; use `clearAll()` when that is the intent.
+	 */
+	clearByPrefix(prefix: string): void {
+		if (!prefix) return;
+		for (const key of this.snapshots.keys()) {
+			if (key.startsWith(prefix)) this.snapshots.delete(key);
+		}
+	}
+
+	/** Forget every cached quota observation. */
+	clearAll(): void {
+		this.snapshots.clear();
+	}
+
 	prune(now = Date.now()): number {
 		let removed = 0;
 		for (const [key, snapshot] of this.snapshots.entries()) {
