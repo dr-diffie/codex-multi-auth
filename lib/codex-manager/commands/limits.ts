@@ -74,6 +74,9 @@ function publicQuotaEntry(entry: QuotaCacheEntry) {
 		updatedAt: entry.updatedAt,
 		status: entry.status,
 		planType: entry.planType ?? null,
+		rateLimitResetCredits: {
+			availableCount: entry.rateLimitResetCredits?.availableCount ?? null,
+		},
 		primary: publicWindow(entry.primary),
 		secondary: publicWindow(entry.secondary),
 	};

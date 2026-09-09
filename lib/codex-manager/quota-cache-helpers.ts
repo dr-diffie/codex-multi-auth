@@ -88,6 +88,9 @@ export function getPersistedQuotaViewForAccount(
 		status: 429,
 		model: cachedEntry?.model ?? DEFAULT_MODEL,
 		planType: cachedEntry?.planType,
+		...(cachedEntry?.rateLimitResetCredits
+			? { rateLimitResetCredits: cachedEntry.rateLimitResetCredits }
+			: {}),
 		primary: {
 			...cachedEntry?.primary,
 			resetAtMs: Math.max(cachedPrimaryResetAt, persistedResetAt),
@@ -103,11 +106,19 @@ export function updateQuotaCacheForAccount(
 	accounts: readonly Pick<AccountMetadataV3, "accountId" | "email">[],
 	emailFallbackState = buildQuotaEmailFallbackState(accounts),
 ): boolean {
+	const previousEntry = getQuotaCacheEntryForAccount(
+		cache,
+		account,
+		accounts,
+		emailFallbackState,
+	);
 	const nextEntry: QuotaCacheEntry = {
 		updatedAt: Date.now(),
 		status: snapshot.status,
 		model: snapshot.model,
 		planType: snapshot.planType,
+		rateLimitResetCredits:
+			snapshot.rateLimitResetCredits ?? previousEntry?.rateLimitResetCredits,
 		primary: {
 			usedPercent: snapshot.primary.usedPercent,
 			windowMinutes: snapshot.primary.windowMinutes,

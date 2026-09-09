@@ -16,6 +16,7 @@ function quotaCache(): QuotaCacheData {
 				status: 200,
 				model: "gpt-5.6-codex",
 				planType: "plus",
+				rateLimitResetCredits: { availableCount: 3 },
 				primary: {
 					usedPercent: 12.5,
 					windowMinutes: 300,
@@ -99,6 +100,7 @@ describe("runLimitsCommand", () => {
 					updatedAt: NOW - 60_000,
 					status: 200,
 					planType: "plus",
+					rateLimitResetCredits: { availableCount: 3 },
 					primary: {
 						usedPercent: 12.5,
 						windowMinutes: 300,
@@ -143,6 +145,7 @@ describe("runLimitsCommand", () => {
 			updatedAt: NOW,
 			status: 200,
 			planType: null,
+			rateLimitResetCredits: { availableCount: null },
 			primary: { usedPercent: null, windowMinutes: null, resetAtMs: null },
 			secondary: { usedPercent: null, windowMinutes: null, resetAtMs: null },
 		});

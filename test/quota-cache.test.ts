@@ -49,6 +49,7 @@ describe("quota cache", () => {
           status: 200,
           model: "gpt-5-codex",
           planType: "plus",
+          rateLimitResetCredits: { availableCount: 3 },
           primary: { usedPercent: 40, windowMinutes: 300 },
           secondary: { usedPercent: 20, windowMinutes: 10080 },
         },
@@ -58,6 +59,9 @@ describe("quota cache", () => {
 
     const loaded = await loadQuotaCache();
     expect(loaded.byAccountId.acc_1?.primary.usedPercent).toBe(40);
+    expect(loaded.byAccountId.acc_1?.rateLimitResetCredits).toEqual({
+      availableCount: 3,
+    });
 
     const fileContent = await fs.readFile(getQuotaCachePath(), "utf8");
     expect(fileContent).toContain('"version": 1');
@@ -415,6 +419,7 @@ describe("quota cache", () => {
             status: 200,
             model: " model-edge ",
             planType: 123,
+            rateLimitResetCredits: { availableCount: -1 },
             primary: "invalid-window",
             secondary: {
               usedPercent: "bad",
@@ -437,6 +442,7 @@ describe("quota cache", () => {
     expect(loaded.byAccountId.invalidWindow?.secondary).toEqual({
       windowMinutes: 120,
     });
+    expect(loaded.byAccountId.invalidWindow?.rateLimitResetCredits).toBeUndefined();
     expect(loaded.byEmail).toEqual({});
   });
 

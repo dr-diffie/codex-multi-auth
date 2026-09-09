@@ -17,6 +17,9 @@ export interface QuotaCacheEntry {
 	status: number;
 	model: string;
 	planType?: string;
+	rateLimitResetCredits?: {
+		availableCount: number;
+	};
 	primary: QuotaCacheWindow;
 	secondary: QuotaCacheWindow;
 }
@@ -61,6 +64,18 @@ function normalizeWindow(value: unknown): QuotaCacheWindow {
 	};
 }
 
+function normalizeRateLimitResetCredits(
+	value: unknown,
+): QuotaCacheEntry["rateLimitResetCredits"] {
+	if (!isRecord(value)) return undefined;
+	const availableCount = value.availableCount;
+	return typeof availableCount === "number" &&
+		Number.isSafeInteger(availableCount) &&
+		availableCount >= 0
+		? { availableCount }
+		: undefined;
+}
+
 /**
  * Normalize and validate a raw parsed value into a quota cache entry.
  *
@@ -91,6 +106,7 @@ function normalizeEntry(value: unknown): QuotaCacheEntry | null {
 		status,
 		model: model.trim(),
 		planType: typeof value.planType === "string" ? value.planType : undefined,
+		rateLimitResetCredits: normalizeRateLimitResetCredits(value.rateLimitResetCredits),
 		primary: normalizeWindow(value.primary),
 		secondary: normalizeWindow(value.secondary),
 	};

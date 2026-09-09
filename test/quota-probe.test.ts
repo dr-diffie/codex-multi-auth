@@ -85,7 +85,108 @@ describe("quota-probe", () => {
 		expect(snapshot.secondary.usedPercent).toBe(64);
 		expect(snapshot.planType).toBe("plus");
 		expect(formatQuotaSnapshotLine(snapshot)).toContain("5h");
-		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("enriches a successful quota snapshot with available reset credits", async () => {
+		const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+			if (String(url) === "https://chatgpt.com/backend-api/wham/usage") {
+				expect(init?.method).toBe("GET");
+				return new Response(
+					JSON.stringify({ rate_limit_reset_credits: { available_count: 3, ignored: "value" } }),
+					{ status: 200 },
+				);
+			}
+			return new Response("", { status: 200, headers: makeQuotaHeaders() });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const snapshot = await fetchCodexQuotaSnapshot({
+			accountId: "acc-credits",
+			accessToken: "token-credits",
+			model: "gpt-5-codex",
+			fallbackModels: [],
+		});
+
+		expect(snapshot.rateLimitResetCredits).toEqual({ availableCount: 3 });
+		expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+			"https://chatgpt.com/backend-api/codex/responses",
+			"https://chatgpt.com/backend-api/wham/usage",
+		]);
+		expect(createCodexHeadersMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("enriches a rate-limited quota snapshot with available reset credits", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response("", { status: 429, headers: makeQuotaHeaders() }),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({ rate_limit_reset_credits: { available_count: 1 } }),
+					{ status: 200 },
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const snapshot = await fetchCodexQuotaSnapshot({
+			accountId: "acc-rate-limited",
+			accessToken: "token-rate-limited",
+			model: "gpt-5-codex",
+			fallbackModels: [],
+		});
+
+		expect(snapshot.status).toBe(429);
+		expect(snapshot.rateLimitResetCredits).toEqual({ availableCount: 1 });
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "4", null])(
+		"ignores invalid reset-credit available_count %j",
+		async (availableCount) => {
+			const fetchMock = vi
+				.fn()
+				.mockResolvedValueOnce(
+					new Response("", { status: 200, headers: makeQuotaHeaders() }),
+				)
+				.mockResolvedValueOnce(
+					new Response(
+						JSON.stringify({
+							rate_limit_reset_credits: { available_count: availableCount },
+						}),
+						{ status: 200 },
+					),
+				);
+			vi.stubGlobal("fetch", fetchMock);
+
+			const snapshot = await fetchCodexQuotaSnapshot({
+				accountId: "acc-invalid-credits",
+				accessToken: "token-invalid-credits",
+				model: "gpt-5-codex",
+				fallbackModels: [],
+			});
+
+			expect(snapshot.rateLimitResetCredits).toBeUndefined();
+		},
+	);
+
+	it("keeps quota success when reset-credit enrichment fails", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response("", { status: 200, headers: makeQuotaHeaders() }))
+			.mockRejectedValueOnce(new Error("usage unavailable"));
+		vi.stubGlobal("fetch", fetchMock);
+
+		const snapshot = await fetchCodexQuotaSnapshot({
+			accountId: "acc-credits-failure",
+			accessToken: "token-credits-failure",
+			model: "gpt-5-codex",
+			fallbackModels: [],
+		});
+
+		expect(snapshot.primary.usedPercent).toBe(32);
+		expect(snapshot.rateLimitResetCredits).toBeUndefined();
 	});
 
 	it("uses gpt-5.6-sol as the default quota probe model", async () => {
@@ -101,7 +202,7 @@ describe("quota-probe", () => {
 
 		expect(snapshot.model).toBe(DEFAULT_PROBE_MODEL);
 		expect(getCodexInstructionsMock).toHaveBeenCalledWith(DEFAULT_PROBE_MODEL);
-		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("falls back from the GPT-5.6 probe model to gpt-5.5 when it is unsupported", async () => {
@@ -142,7 +243,7 @@ describe("quota-probe", () => {
 		});
 
 		expect(snapshot.model).toBe(DEFAULT_MODEL);
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(1, DEFAULT_PROBE_MODEL);
 		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(2, DEFAULT_MODEL);
 	});
@@ -181,13 +282,13 @@ describe("quota-probe", () => {
 		});
 
 		expect(snapshot.model).toBe("gpt-5.2-codex");
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(1, "gpt-5.3-codex");
 		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(2, "gpt-5.2-codex");
 	});
 
 	it("accepts 429 responses when quota headers are present", async () => {
-		const fetchMock = vi.fn(async () =>
+		const fetchMock = vi.fn(async (_url: string | URL | Request) =>
 			new Response("", {
 				status: 429,
 				headers: makeQuotaHeaders({ "x-codex-secondary-used-percent": "100" }),
@@ -204,6 +305,10 @@ describe("quota-probe", () => {
 
 		expect(snapshot.status).toBe(429);
 		expect(formatQuotaSnapshotLine(snapshot)).toContain("rate-limited");
+		expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+			"https://chatgpt.com/backend-api/codex/responses",
+			"https://chatgpt.com/backend-api/wham/usage",
+		]);
 	});
 
 	it("times out a stalled probe and surfaces abort failure", async () => {

@@ -96,7 +96,12 @@ codex-multi-auth auth limits --json --refresh
 The default command reads the local quota cache and performs no network
 requests. `--refresh` reuses the dashboard's sequential quota refresh and its
 five-minute freshness floor: only enabled accounts with usable credentials and
-missing or stale cache entries are probed. Countdown text should be calculated
+missing or stale cache entries are probed. A successful quota probe also makes a
+best-effort read-only usage-summary request and caches only the optional banked
+reset-credit count. If that optional enrichment is temporarily unavailable, a
+previously confirmed count is retained instead of being erased. The usage summary
+does not include per-credit expiry; `limits` never requests reset-credit details
+and never consumes or redeems a reset. Countdown text should be calculated
 by the consumer from `resetAtMs`; the command emits numeric values rather than
 locale-formatted dates.
 
@@ -104,8 +109,10 @@ The top-level object has `schemaVersion: 1`, a millisecond `generatedAt`, a
 `mode` of `cached` or `refresh` describing the requested command mode,
 `selection`, and `accounts`. Each configured account includes
 `index`, `label`, `enabled`, `current`, and either a `quota` object or `null`.
-Quota objects contain `updatedAt`, HTTP `status`, `planType`, and `primary` /
-`secondary` windows with `usedPercent`, `windowMinutes`, and `resetAtMs`.
+Quota objects contain `updatedAt`, HTTP `status`, `planType`, optional
+`rateLimitResetCredits.availableCount`, and `primary` / `secondary` windows with
+`usedPercent`, `windowMinutes`, and `resetAtMs`. A null reset-credit count means
+unknown or unavailable, not zero.
 Unavailable provider values are explicit JSON `null`; internal probe-model names,
 credentials, and orphan cache entries are not emitted. Account emails are masked
 inside `label` the same way `forecast --json` masks them.

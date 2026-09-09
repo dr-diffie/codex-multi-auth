@@ -115,13 +115,36 @@ describe("updateQuotaCacheForAccount", () => {
 		const cache = makeCache({
 			byEmail: { "a@example.com": makeEntry() },
 		});
-		expect(updateQuotaCacheForAccount(cache, uniqueAccount, makeSnapshot(), accounts)).toBe(true);
+		expect(
+			updateQuotaCacheForAccount(
+				cache,
+				uniqueAccount,
+				makeSnapshot({ rateLimitResetCredits: { availableCount: 3 } }),
+				accounts,
+			),
+		).toBe(true);
 		expect(cache.byAccountId.acc_a).toMatchObject({
 			updatedAt: NOW,
 			status: 200,
+			rateLimitResetCredits: { availableCount: 3 },
 			primary: { usedPercent: 75, windowMinutes: 300, resetAtMs: NOW + 30_000 },
 		});
 		expect(cache.byEmail).toEqual({});
+	});
+
+	it("retains the last known reset count when optional enrichment is unavailable", () => {
+		const cache = makeCache({
+			byAccountId: {
+				acc_a: makeEntry({ rateLimitResetCredits: { availableCount: 2 } }),
+			},
+		});
+
+		expect(
+			updateQuotaCacheForAccount(cache, uniqueAccount, makeSnapshot(), accounts),
+		).toBe(true);
+		expect(cache.byAccountId.acc_a?.rateLimitResetCredits).toEqual({
+			availableCount: 2,
+		});
 	});
 
 	it("falls back to the email key when the account id is not unique", () => {

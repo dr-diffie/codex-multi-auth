@@ -52,12 +52,16 @@ export interface CodexQuotaSnapshot {
 	status: number;
 	planType?: string;
 	activeLimit?: number;
+	rateLimitResetCredits?: {
+		availableCount: number;
+	};
 	primary: CodexQuotaWindow;
 	secondary: CodexQuotaWindow;
 	model: string;
 }
 
 const DEFAULT_QUOTA_PROBE_MODELS = QUOTA_PROBE_MODEL_CHAIN;
+const RESET_CREDIT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
 /**
  * Parse an HTTP header value and return it as a finite number.
@@ -238,6 +242,44 @@ function extractErrorMessage(bodyText: string, status: number): string {
 		// Fall through to raw body text.
 	}
 	return trimmed;
+}
+
+/** Best-effort provider-owned enrichment for the banked reset-credit count. */
+async function fetchRateLimitResetCredits(
+	options: ProbeCodexQuotaOptions,
+	model: string,
+	timeoutMs: number,
+): Promise<CodexQuotaSnapshot["rateLimitResetCredits"]> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const headers = createCodexHeaders(undefined, options.accountId, options.accessToken, {
+			model,
+		});
+		const response = await fetch(RESET_CREDIT_USAGE_URL, {
+			method: "GET",
+			headers,
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			await response.body?.cancel().catch(() => undefined);
+			return undefined;
+		}
+		const payload = (await response.json()) as unknown;
+		if (!isRecord(payload) || !isRecord(payload.rate_limit_reset_credits)) {
+			return undefined;
+		}
+		const availableCount = payload.rate_limit_reset_credits.available_count;
+		return typeof availableCount === "number" &&
+			Number.isSafeInteger(availableCount) &&
+			availableCount >= 0
+			? { availableCount }
+			: undefined;
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 /**
@@ -430,7 +472,16 @@ export async function fetchCodexQuotaSnapshot(
 				} catch {
 					// Best effort cancellation.
 				}
-				return { ...snapshotBase, model };
+				const rateLimitResetCredits = await fetchRateLimitResetCredits(
+					options,
+					model,
+					timeoutMs,
+				);
+				return {
+					...snapshotBase,
+					model,
+					...(rateLimitResetCredits ? { rateLimitResetCredits } : {}),
+				};
 			}
 
 			if (!response.ok) {
