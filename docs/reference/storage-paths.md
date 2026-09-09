@@ -28,6 +28,8 @@ Override root:
 | Flagged accounts | `~/.codex/multi-auth/openai-codex-flagged-accounts.json` |
 | Flagged accounts backup | `~/.codex/multi-auth/openai-codex-flagged-accounts.json.bak` |
 | Quota cache | `~/.codex/multi-auth/quota-cache.json` |
+| Reset-summary cache | `~/.codex/multi-auth/reset-credit-summary-cache.json` (count and observation time under SHA-256 identity hashes) |
+| Reset-summary write lock | `~/.codex/multi-auth/reset-credit-summary-cache.json.lock` (transient; remove manually only after a process was terminated during a write) |
 | Runtime observability | `~/.codex/multi-auth/runtime-observability.json` |
 | First-run setup marker | `~/.codex/multi-auth/first-run-setup.json` |
 | Alternate / legacy plugin config | `~/.codex/multi-auth/config.json` |

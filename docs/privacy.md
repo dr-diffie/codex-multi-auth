@@ -20,6 +20,7 @@
 | Accounts | `~/.codex/multi-auth/openai-codex-accounts.json` | Primary saved account pool (V3 JSON) |
 | Flagged accounts | `~/.codex/multi-auth/openai-codex-flagged-accounts.json` | Accounts with hard auth failures |
 | Quota cache | `~/.codex/multi-auth/quota-cache.json` | Cached quota snapshots |
+| Reset-summary cache | `~/.codex/multi-auth/reset-credit-summary-cache.json` | Optional banked-reset counts and observation times keyed by SHA-256 identity hashes; absent hashes expire after 30 days; no plaintext account IDs or emails |
 | Runtime observability | `~/.codex/multi-auth/runtime-observability.json` | Local request counters and last-account metadata for status/report output |
 | First-run setup marker | `~/.codex/multi-auth/first-run-setup.json` | One-time durable-install app bind / launcher setup claim; not secrets |
 | Cross-process refresh leases | `~/.codex/multi-auth/refresh-leases/` | Short-lived lease files that dedupe concurrent token refresh |
@@ -78,6 +79,7 @@ rm -f ~/.codex/multi-auth/settings.json
 rm -f ~/.codex/multi-auth/openai-codex-accounts.json
 rm -f ~/.codex/multi-auth/openai-codex-flagged-accounts.json
 rm -f ~/.codex/multi-auth/quota-cache.json
+rm -f ~/.codex/multi-auth/reset-credit-summary-cache.json ~/.codex/multi-auth/reset-credit-summary-cache.json.lock
 rm -f ~/.codex/multi-auth/runtime-observability.json
 rm -f ~/.codex/multi-auth/first-run-setup.json
 rm -f ~/.codex/multi-auth/config.json
@@ -105,6 +107,7 @@ Remove-Item "$HOME\.codex\multi-auth\settings.json" -Force -ErrorAction Silently
 Remove-Item "$HOME\.codex\multi-auth\openai-codex-accounts.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\openai-codex-flagged-accounts.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\quota-cache.json" -Force -ErrorAction SilentlyContinue
+Remove-Item "$HOME\.codex\multi-auth\reset-credit-summary-cache.json","$HOME\.codex\multi-auth\reset-credit-summary-cache.json.lock" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\runtime-observability.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\first-run-setup.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\config.json" -Force -ErrorAction SilentlyContinue

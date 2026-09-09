@@ -99,11 +99,21 @@ five-minute freshness floor: only enabled accounts with usable credentials and
 missing or stale cache entries are probed. A successful quota probe also makes a
 best-effort read-only usage-summary request and caches only the optional banked
 reset-credit count. If that optional enrichment is temporarily unavailable, a
-previously confirmed count is retained instead of being erased. The usage summary
-does not include per-credit expiry; `limits` never requests reset-credit details
-and never consumes or redeems a reset. Countdown text should be calculated
-by the consumer from `resetAtMs`; the command emits numeric values rather than
-locale-formatted dates.
+previously confirmed count is retained instead of being erased. Confirmed counts
+are also mirrored into a protected reset-summary sidecar; cached reads merge
+that sidecar when an older installed release has rewritten `quota-cache.json`
+without the optional field. On POSIX, the sidecar is owner-only (`0600` inside
+a `0700` runtime directory); on Windows it inherits the user's profile ACL. It
+stores only count summaries plus observation timestamps under SHA-256 identity
+hashes. Identity hashes absent from current snapshots expire after 30 days,
+preventing an older concurrent writer from prematurely deleting a newer entry.
+It contains no
+credentials, tokens, plaintext account IDs/emails, individual reset-credit
+records, expiry timestamps, or redemption data. The usage summary does not
+include per-credit expiry;
+`limits` never requests reset-credit details and never consumes or redeems a reset.
+Countdown text should be calculated by the consumer from `resetAtMs`; the command
+emits numeric values rather than locale-formatted dates.
 
 The top-level object has `schemaVersion: 1`, a millisecond `generatedAt`, a
 `mode` of `cached` or `refresh` describing the requested command mode,

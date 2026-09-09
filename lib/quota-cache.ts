@@ -2,6 +2,10 @@ import { existsSync, promises as fs } from "node:fs";
 import { basename, join } from "node:path";
 import { withRetry } from "./fs-retry.js";
 import { logWarn } from "./logger.js";
+import {
+	hydrateRetainedResetCredits,
+	preserveKnownResetCredits,
+} from "./reset-credit-cache.js";
 import { getCodexMultiAuthDir } from "./runtime-paths.js";
 import { tempPathFor } from "./temp-path.js";
 import { isRecord } from "./utils.js";
@@ -190,10 +194,10 @@ export async function loadQuotaCache(): Promise<QuotaCacheData> {
 			return { byAccountId: {}, byEmail: {} };
 		}
 
-		return {
+		return hydrateRetainedResetCredits({
 			byAccountId: normalizeEntryMap(parsed.byAccountId),
 			byEmail: normalizeEntryMap(parsed.byEmail),
-		};
+		});
 	} catch (error) {
 		logWarn(
 			`Failed to load quota cache from ${QUOTA_CACHE_LABEL}: ${
@@ -232,6 +236,7 @@ export async function saveQuotaCache(data: QuotaCacheData): Promise<void> {
 
 	const writeTask = async (): Promise<void> => {
 		try {
+			await preserveKnownResetCredits(data);
 			const cacheDir = getCodexMultiAuthDir();
 			// The quota cache lives alongside other at-rest secrets, so keep the
 			// directory owner-only on POSIX (mode is a no-op on win32 / ACL-based).

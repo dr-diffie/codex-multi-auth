@@ -265,6 +265,7 @@ which would rebind the row to a different workspace.
 | Accounts | `~/.codex/multi-auth/openai-codex-accounts.json` |
 | Flagged accounts | `~/.codex/multi-auth/openai-codex-flagged-accounts.json` |
 | Quota cache | `~/.codex/multi-auth/quota-cache.json` |
+| Reset-summary cache | `~/.codex/multi-auth/reset-credit-summary-cache.json` |
 | Runtime observability | `~/.codex/multi-auth/runtime-observability.json` |
 | Usage ledger | `~/.codex/multi-auth/usage/usage-ledger.jsonl` |
 | Account policies | `~/.codex/multi-auth/account-policies.json` |

@@ -67,6 +67,137 @@ describe("quota cache", () => {
     expect(fileContent).toContain('"version": 1');
   });
 
+  it("restores reset counts after an older writer replaces the main quota cache", async () => {
+    const { loadQuotaCache, saveQuotaCache, getQuotaCachePath } =
+      await import("../lib/quota-cache.js");
+    const entry = {
+      updatedAt: Date.now(),
+      status: 200,
+      model: "gpt-5-codex",
+      rateLimitResetCredits: { availableCount: 2 },
+      primary: { usedPercent: 40, windowMinutes: 300 },
+      secondary: { usedPercent: 20, windowMinutes: 10080 },
+    };
+    await saveQuotaCache({ byAccountId: { acc_1: entry }, byEmail: {} });
+
+    const sidecarPath = join(tempDir, "reset-credit-summary-cache.json");
+    const sidecarRaw = await fs.readFile(sidecarPath, "utf8");
+    expect(sidecarRaw).not.toContain("acc_1");
+    expect(sidecarRaw).toMatch(/"[0-9a-f]{64}"/);
+    if (process.platform !== "win32") {
+      expect((await fs.stat(sidecarPath)).mode & 0o777).toBe(0o600);
+    }
+
+    await saveQuotaCache({
+      byAccountId: {
+        acc_1: {
+          ...entry,
+          updatedAt: entry.updatedAt - 1_000,
+          rateLimitResetCredits: { availableCount: 1 },
+        },
+      },
+      byEmail: {},
+    });
+
+    await fs.writeFile(
+      getQuotaCachePath(),
+      `${JSON.stringify({
+        version: 1,
+        byAccountId: {
+          acc_1: { ...entry, rateLimitResetCredits: undefined },
+        },
+        byEmail: {},
+      })}\n`,
+      "utf8",
+    );
+
+    const loaded = await loadQuotaCache();
+    expect(loaded.byAccountId.acc_1?.rateLimitResetCredits).toEqual({
+      availableCount: 2,
+    });
+
+    const agedSidecar = JSON.parse(await fs.readFile(sidecarPath, "utf8"));
+    for (const retained of Object.values(agedSidecar.byIdentityHash) as Array<{
+      lastSeenAt: number;
+    }>) {
+      retained.lastSeenAt = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    }
+    await fs.writeFile(sidecarPath, JSON.stringify(agedSidecar), "utf8");
+    await saveQuotaCache({ byAccountId: {}, byEmail: {} });
+    expect(JSON.parse(await fs.readFile(sidecarPath, "utf8"))).toEqual({
+      version: 1,
+      byIdentityHash: {},
+    });
+  });
+
+  it("ignores a corrupt reset-summary sidecar", async () => {
+    const { loadQuotaCache, getQuotaCachePath } =
+      await import("../lib/quota-cache.js");
+    await fs.writeFile(
+      join(tempDir, "reset-credit-summary-cache.json"),
+      "not-json",
+      "utf8",
+    );
+    await fs.writeFile(
+      getQuotaCachePath(),
+      JSON.stringify({ version: 1, byAccountId: {}, byEmail: {} }),
+      "utf8",
+    );
+
+    await expect(loadQuotaCache()).resolves.toEqual({
+      byAccountId: {},
+      byEmail: {},
+    });
+  });
+
+  it("serializes concurrent sidecar writers and retains the newest observation", async () => {
+    const { preserveKnownResetCredits } =
+      await import("../lib/reset-credit-cache.js");
+    const { loadQuotaCache, getQuotaCachePath } =
+      await import("../lib/quota-cache.js");
+    const now = Date.now();
+    const quota = (updatedAt: number, availableCount: number) => ({
+      byAccountId: {
+        acc_1: {
+          updatedAt,
+          rateLimitResetCredits: { availableCount },
+        },
+      },
+      byEmail: {},
+    });
+
+    await Promise.all([
+      preserveKnownResetCredits(quota(now, 4)),
+      preserveKnownResetCredits(quota(now - 1_000, 1)),
+    ]);
+    await fs.writeFile(
+      getQuotaCachePath(),
+      JSON.stringify({
+        version: 1,
+        byAccountId: {
+          acc_1: {
+            updatedAt: now,
+            status: 200,
+            model: "gpt-5-codex",
+            primary: {},
+            secondary: {},
+          },
+        },
+        byEmail: {},
+      }),
+      "utf8",
+    );
+
+    expect(
+      (await loadQuotaCache()).byAccountId.acc_1?.rateLimitResetCredits,
+    ).toEqual({ availableCount: 4 });
+    expect(
+      (await fs.readdir(tempDir)).filter(
+        (name) => name === "reset-credit-summary-cache.json.lock",
+      ),
+    ).toEqual([]);
+  });
+
   it("stages atomic writes through tempPathFor and leaves no .tmp behind", async () => {
     // End-to-end check of the staging contract this PR centralizes: the save
     // must write a sibling named by tempPathFor (<target>.<pid>.<ms>.<hex8>.tmp,
@@ -74,9 +205,8 @@ describe("quota cache", () => {
     // free of staging leftovers.
     const renameSpy = vi.spyOn(fs, "rename");
     try {
-      const { saveQuotaCache, getQuotaCachePath } = await import(
-        "../lib/quota-cache.js"
-      );
+      const { saveQuotaCache, getQuotaCachePath } =
+        await import("../lib/quota-cache.js");
 
       await saveQuotaCache({ byAccountId: {}, byEmail: {} });
 
@@ -191,12 +321,15 @@ describe("quota cache", () => {
   it.each(["EBUSY", "EPERM"] as const)(
     "retries atomic rename on transient %s errors",
     async (code) => {
-      const { saveQuotaCache, loadQuotaCache } =
+      const { saveQuotaCache, loadQuotaCache, getQuotaCachePath } =
         await import("../lib/quota-cache.js");
       const realRename = fs.rename;
       const renameSpy = vi.spyOn(fs, "rename");
       let attempts = 0;
       renameSpy.mockImplementation(async (...args) => {
+        if (String(args[1]) !== getQuotaCachePath()) {
+          return realRename(...args);
+        }
         attempts += 1;
         if (attempts < 3) {
           const error = new Error(
@@ -442,7 +575,9 @@ describe("quota cache", () => {
     expect(loaded.byAccountId.invalidWindow?.secondary).toEqual({
       windowMinutes: 120,
     });
-    expect(loaded.byAccountId.invalidWindow?.rateLimitResetCredits).toBeUndefined();
+    expect(
+      loaded.byAccountId.invalidWindow?.rateLimitResetCredits,
+    ).toBeUndefined();
     expect(loaded.byEmail).toEqual({});
   });
 
